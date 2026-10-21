@@ -2,35 +2,95 @@ name: Release
 
 on:
   push:
-    tags: ['v*']
+    branches: [main]
 
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  release:
+  tag:
+    name: Gerar tag SemVer
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v6
+      - name: Checkout com histórico e tags
+        uses: actions/checkout@v4
         with:
-          go-version: '1.25.x'
-          cache: true
-      - name: Test
-        run: go test ./...
-      - name: Build release binaries
+          fetch-depth: 0
+
+      - name: Calcular e publicar versão
         shell: bash
         run: |
-          mkdir -p dist
-          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64 windows/amd64 windows/arm64; do
-            os="${target%/*}"
-            arch="${target#*/}"
-            ext=""
-            if [ "$os" = windows ]; then ext=".exe"; fi
-            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build -buildvcs=false -trimpath \
-              -ldflags="-s -w" -o "dist/backhere-$os-$arch$ext" .
-          done
-      - uses: softprops/action-gh-release@v2
-        with:
-          files: dist/*
-          generate_release_notes: true
+          set -euo pipefail
+
+          git fetch --tags --force
+
+          if [[ -n "$(git tag --points-at HEAD)" ]]; then
+            echo "HEAD já está marcado; nada a publicar."
+            exit 0
+          fi
+
+          latest_tag="$(git tag --list 'v[1-9]*.[0-9]*.[0-9]*' --sort=-version:refname | head -n 1)"
+
+          if [[ -z "${latest_tag}" ]]; then
+            next_tag="v1.0.0"
+            bump="primeira release"
+          else
+            version="${latest_tag#v}"
+            IFS=. read -r base_major base_minor base_patch <<< "${version}"
+            commit_range="${latest_tag}..HEAD"
+
+            commit_count="$(git rev-list --count "${commit_range}" 2>/dev/null || echo 0)"
+            if [[ "${commit_count}" -eq 0 ]]; then
+              echo "Não há commits para versionar."
+              exit 0
+            fi
+
+            bump=patch
+            while IFS= read -r commit; do
+              if git log -1 --format=%B "${commit}" | grep -Eq 'BREAKING CHANGE|BREAKING-CHANGE'; then
+                bump=major
+                break
+              elif git log -1 --format=%s "${commit}" | grep -Eq '^[A-Za-z]+(\([^)]*\))?!:'; then
+                bump=major
+                break
+              elif git log -1 --format=%s "${commit}" | grep -Eq '^feat(\([^)]*\))?:'; then
+                bump=minor
+              fi
+            done < <(git rev-list "${commit_range}")
+
+            case "${bump}" in
+              major)
+                next_major=$((base_major + 1))
+                next_minor=0
+                next_patch=0
+                ;;
+              minor)
+                next_major=${base_major}
+                next_minor=$((base_minor + 1))
+                next_patch=0
+                ;;
+              *)
+                next_major=${base_major}
+                next_minor=${base_minor}
+                next_patch=$((base_patch + 1))
+                ;;
+            esac
+
+            next_tag="v${next_major}.${next_minor}.${next_patch}"
+          fi
+
+          if git rev-parse "${next_tag}" >/dev/null 2>&1; then
+            echo "A tag ${next_tag} já existe; nada a publicar."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "${next_tag}" -m "release: ${next_tag}" "${GITHUB_SHA}"
+          git push origin "${next_tag}"
+          echo "Tag ${next_tag} publicada (${bump})."
